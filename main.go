@@ -3,11 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/gofiber/fiber/v2"
+	log "github.com/sirupsen/logrus"
 	"os"
 	"time"
-
-	"github.com/gofiber/fiber/v2"
 )
 
 type ActionEvent struct {
@@ -94,12 +93,21 @@ func isStandardField(field string) bool {
 }
 
 func saveToFile(event ActionEvent) error {
-	filename := fmt.Sprintf("%s_events.json", event.CustomerID)
+	err := os.MkdirAll("./data", os.ModePerm)
+	if err != nil {
+		return err
+	} // Ensure the data directory exists
+	filename := fmt.Sprintf("./data/%s_events.json", event.CustomerID)
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+			log.Error(err)
+		}
+	}(file)
 
 	encoder := json.NewEncoder(file)
 	return encoder.Encode(event)
