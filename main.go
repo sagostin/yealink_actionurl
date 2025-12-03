@@ -6,11 +6,16 @@ import (
 	"github.com/gofiber/fiber/v2"
 	log "github.com/sirupsen/logrus"
 	"os"
+	"strconv"
 	"time"
 )
 
 // Global LogManager so handlers can use it
-var lm *LogManager
+var (
+	lm                *LogManager
+	saveToFileEnabled bool
+	dataDir           string
+)
 
 type ActionEvent struct {
 	Timestamp      time.Time
@@ -34,6 +39,13 @@ type ActionEvent struct {
 }
 
 func main() {
+	// Read env-based options
+	saveToFileEnabled = getEnvBool("SAVE_TO_FILE", true)
+	dataDir = os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+
 	// Init Loki client + LogManager
 	lokiClient := NewLokiClient()
 	lm = NewLogManager(lokiClient)
@@ -41,10 +53,12 @@ func main() {
 	defer lm.CloseLogManager()
 
 	log.WithFields(log.Fields{
-		"enabled":  lokiClient.Enabled,
-		"push_url": lokiClient.PushURL,
-		"job":      lokiClient.Job,
-	}).Info("Initialized Loki client for action event logger")
+		"loki_enabled":  lokiClient.Enabled,
+		"loki_push_url": lokiClient.PushURL,
+		"loki_job":      lokiClient.Job,
+		"save_to_file":  saveToFileEnabled,
+		"data_dir":      dataDir,
+	}).Info("Initialized action event logger")
 
 	app := fiber.New()
 	app.Get("/action/:customerID/:eventType", handleActionEvent)
@@ -85,26 +99,33 @@ func handleActionEvent(c *fiber.Ctx) error {
 		}
 	})
 
-	// Save to flat file (local audit trail)
-	if err := saveToFile(event); err != nil {
-		log.WithError(err).Error("failed to save action event to file")
+	// Save to flat file (local audit trail), *if enabled*
+	if saveToFileEnabled {
+		if err := saveToFile(event); err != nil {
+			log.WithError(err).Error("failed to save action event to file")
 
-		// Also send error to Loki (if configured)
-		if lm != nil {
-			fields := buildLokiFieldsFromEvent(&event)
-			fields["error"] = err.Error()
-			l := lm.BuildLog(
-				"PHONE_ACTION",
-				"Failed to save action event for customer %s (%s)",
-				log.ErrorLevel,
-				fields,
-				event.CustomerID,
-				event.EventType,
-			)
-			lm.SendLog(l)
+			// Also send error to Loki (if configured)
+			if lm != nil {
+				fields := buildLokiFieldsFromEvent(&event)
+				fields["error"] = err.Error()
+				l := lm.BuildLog(
+					"PHONE_ACTION",
+					"Failed to save action event for customer %s (%s)",
+					log.ErrorLevel,
+					fields,
+					event.CustomerID,
+					event.EventType,
+				)
+				lm.SendLog(l)
+			}
+
+			return c.Status(500).SendString("Error saving event")
 		}
-
-		return c.Status(500).SendString("Error saving event")
+	} else {
+		log.WithFields(log.Fields{
+			"customer_id": event.CustomerID,
+			"event_type":  event.EventType,
+		}).Debug("SAVE_TO_FILE is disabled; event not written to disk")
 	}
 
 	// Send successful event to Loki
@@ -139,11 +160,11 @@ func isStandardField(field string) bool {
 
 func saveToFile(event ActionEvent) error {
 	// Ensure the data directory exists
-	if err := os.MkdirAll("./data", os.ModePerm); err != nil {
+	if err := os.MkdirAll(dataDir, os.ModePerm); err != nil {
 		return err
 	}
 
-	filename := fmt.Sprintf("./data/%s_events.json", event.CustomerID)
+	filename := fmt.Sprintf("%s/%s_events.json", dataDir, event.CustomerID)
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -185,4 +206,17 @@ func buildLokiFieldsFromEvent(event *ActionEvent) map[string]interface{} {
 	}
 
 	return fields
+}
+
+// getEnvBool reads a bool env var with a default.
+func getEnvBool(name string, def bool) bool {
+	v, ok := os.LookupEnv(name)
+	if !ok || v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
